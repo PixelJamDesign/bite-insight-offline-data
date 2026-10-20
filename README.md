@@ -13,3 +13,9 @@ Product data © Open Food Facts contributors.
 ## Updating
 
 Build with `scripts/build-offline-db.js` in the app repo, then create a new release here with every `.db` file and `manifest.json`, and mark it as the latest release.
+
+## UK products for swaps
+
+The app also suggests healthier swaps by supermarket. Those come from a table of UK products in the app's Supabase database, built from the same export by the scripts in `scripts/off-uk/`.
+
+A GitHub Action (`.github/workflows/off-uk-sync.yml`) applies Open Food Facts' daily changes every night and does a full reload on the first Sunday of each month. It needs the `SUPABASE_SERVICE_ROLE_KEY` repository secret. To run it by hand, use "Run workflow" on the Actions tab.

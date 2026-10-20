@@ -1,0 +1,52 @@
+# Keeps the Bite Insight app's off_products_uk table (Supabase) fresh.
+#
+# Nightly: apply Open Food Facts' daily delta(s).
+# First Sunday of the month: full reload, which also rebuilds the brand ->
+# chains map and drops products that have gone.
+#
+# Needs the repository secret SUPABASE_SERVICE_ROLE_KEY.
+name: OFF UK sync
+
+on:
+  schedule:
+    - cron: '30 3 * * *'   # 03:30 UTC, after OFF publishes the day's delta
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: delta or full
+        default: delta
+
+permissions:
+  contents: read
+
+concurrency:
+  group: off-uk-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      SUPABASE_URL: https://bfkxjgbvsygvenmciasg.supabase.co
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Pick mode
+        id: mode
+        run: |
+          mode="${{ github.event.inputs.mode || 'delta' }}"
+          # First Sunday of the month: full reload instead.
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "$(date -u +%u)" = "7" ] && [ "$(date -u +%d)" -le 7 ]; then
+            mode=full
+          fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+      - name: Apply deltas
+        if: steps.mode.outputs.mode == 'delta'
+        run: python3 -I scripts/off-uk/apply_delta.py
+      - name: Full reload
+        if: steps.mode.outputs.mode == 'full'
+        run: python3 -I scripts/off-uk/load_full.py
