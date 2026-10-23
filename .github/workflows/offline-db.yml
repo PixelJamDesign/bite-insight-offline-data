@@ -45,6 +45,7 @@ jobs:
       version: ${{ steps.plan.outputs.version }}
       tag: ${{ steps.plan.outputs.tag }}
       artifact: ${{ steps.plan.outputs.artifact }}
+      sums: ${{ steps.sums.outputs.sums }}
     env:
       OUT: ${{ github.workspace }}/offline-db-out
     steps:
@@ -134,6 +135,19 @@ jobs:
           if [ -n "$REGION" ]; then args+=(--regions "$REGION"); fi
           node check.js "${args[@]}"
 
+      # Fingerprints of the files check.js just passed. They travel as a job
+      # output, outside the artifact, so the publish job can prove it is
+      # uploading exactly these files.
+      - name: Fingerprint the checked files
+        id: sums
+        working-directory: ${{ env.OUT }}
+        run: |
+          {
+            echo "sums<<END_OF_SUMS"
+            sha256sum offline_*_products.db manifest.json
+            echo "END_OF_SUMS"
+          } >> "$GITHUB_OUTPUT"
+
       # Dry run: the files to look at. Publish: what the publish job uploads.
       - name: Keep the files
         uses: actions/upload-artifact@v6
@@ -168,7 +182,18 @@ jobs:
           REPO: ${{ github.repository }}
           VERSION: ${{ needs.build.outputs.version }}
           TAG: ${{ needs.build.outputs.tag }}
+          SUMS: ${{ needs.build.outputs.sums }}
         run: |
+          # The files must be byte for byte the ones check.js passed.
+          if [ -z "$SUMS" ]; then
+            echo "::error::The build job didn't pass on the files' fingerprints. Nothing was published."
+            exit 1
+          fi
+          if ! (cd "$OUT" && printf '%s\n' "$SUMS" | sha256sum --check --strict --quiet -); then
+            echo "::error::The downloaded files don't match the ones that passed the checks. Nothing was published."
+            exit 1
+          fi
+
           version=$(node -p "require(process.env.OUT + '/manifest.json').version")
           if [ "$version" != "$VERSION" ]; then
             echo "::error::manifest.json says $version but the build was for $VERSION. Nothing was published."
@@ -185,7 +210,14 @@ jobs:
           fi
 
           node scripts/offline-db/release-notes.js --dir "$OUT" > "$RUNNER_TEMP/notes.md"
-          files=("$OUT"/*.db "$OUT/manifest.json")
+          # Upload exactly what the manifest lists, plus the manifest.
+          files=()
+          while IFS= read -r f; do files+=("$f"); done < <(node -e "const m=require(process.env.OUT+'/manifest.json');for(const r of Object.values(m.regions))console.log(process.env.OUT+'/'+r.filename)")
+          files+=("$OUT/manifest.json")
+          if [ "$(printf '%s\n' "$SUMS" | wc -l)" -ne "${#files[@]}" ]; then
+            echo "::error::The manifest lists different files from the ones that were checked. Nothing was published."
+            exit 1
+          fi
 
           # Upload to a draft first. The app only sees published releases, so
           # if an upload fails nothing changes for users.
@@ -223,5 +255,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: |
-          gh workflow enable offline-db.yml --repo "$REPO"
-          gh workflow enable off-uk-sync.yml --repo "$REPO"
+          for wf in offline-db.yml off-uk-sync.yml; do
+            state=$(gh api "repos/$REPO/actions/workflows/$wf" --jq .state)
+            # One switched off by hand stays off.
+            if [ "$state" = "disabled_manually" ]; then
+              echo "::notice::$wf was turned off by hand, so it's left off."
+            else
+              gh workflow enable "$wf" --repo "$REPO"
+            fi
+          done
