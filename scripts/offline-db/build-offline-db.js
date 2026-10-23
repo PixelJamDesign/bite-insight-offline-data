@@ -19,6 +19,7 @@
  *                                                 # after 2000 products
  *   node build-offline-db.js --out /tmp/offline   # write somewhere else
  *   node build-offline-db.js --source URL         # another copy of the export
+ *   node build-offline-db.js --version 2026-11-02 # date to stamp (default today, UTC)
  *
  * Output (default scripts/offline-db/output):
  *   offline_{code}_products.db   SQLite database per region
@@ -53,6 +54,33 @@ const DEFAULT_OUTPUT_DIR = path.join(__dirname, 'output');
 const BATCH_SIZE = 5000;
 // Give up if the export stops sending data for this long.
 const IDLE_TIMEOUT_MS = 5 * 60 * 1000;
+
+// Export columns extractRow and the filters read. If Open Food Facts
+// renames or drops one, the rows would quietly come out empty (that is
+// how the May 2026 release lost its allergens), so the build stops at the
+// header instead. Fallbacks the export doesn't have (product_name_en,
+// image_front_url, the _serving values) aren't listed.
+const REQUIRED_EXPORT_COLUMNS = [
+  'code', 'product_name', 'brands', 'image_url', 'quantity', 'nutriscore_grade',
+  'countries_tags', 'serving_size',
+  'energy-kcal_100g', 'carbohydrates_100g', 'sugars_100g', 'fiber_100g',
+  'fat_100g', 'saturated-fat_100g', 'proteins_100g', 'salt_100g',
+  'ingredients_text', 'ingredients_tags',
+  'allergens', 'allergens_en', 'traces', 'traces_tags', 'traces_en',
+];
+
+/** Throws if the export header is missing a column we read. */
+function checkExportHeader(header) {
+  const have = new Set(header);
+  const missing = REQUIRED_EXPORT_COLUMNS.filter((c) => !have.has(c));
+  if (missing.length) {
+    throw new Error(
+      `The export has no ${missing.join(', ')} column${missing.length > 1 ? 's' : ''}. ` +
+        `Open Food Facts may have renamed ${missing.length > 1 ? 'them' : 'it'}; update extractRow and REQUIRED_EXPORT_COLUMNS before building.`,
+    );
+  }
+  return header;
+}
 
 // ── Region definitions ───────────────────────────────────────────────────────
 const REGION_FILTERS = {
@@ -363,12 +391,18 @@ function extractRow(record) {
 
 function usageError(message) {
   console.error(message);
-  console.error('Usage: node build-offline-db.js [--region gb[,us...]] [--limit N] [--out DIR] [--source URL]');
+  console.error('Usage: node build-offline-db.js [--region gb[,us...]] [--limit N] [--out DIR] [--source URL] [--version YYYY-MM-DD]');
   process.exit(1);
 }
 
 function parseArgs(argv) {
-  const opts = { regionCodes: Object.keys(REGION_FILTERS), limit: null, outDir: DEFAULT_OUTPUT_DIR, source: CSV_URL };
+  const opts = {
+    regionCodes: Object.keys(REGION_FILTERS),
+    limit: null,
+    outDir: DEFAULT_OUTPUT_DIR,
+    source: CSV_URL,
+    version: new Date().toISOString().slice(0, 10),
+  };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     const value = () => {
@@ -394,6 +428,11 @@ function parseArgs(argv) {
     } else if (arg === '--source') {
       opts.source = value();
       if (!/^https?:\/\//.test(opts.source)) usageError('--source needs an http(s) URL of a .csv.gz export.');
+    } else if (arg === '--version') {
+      // The workflow passes the date the run started, so a build that
+      // finishes after midnight still gets the tag it checked for.
+      opts.version = value();
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(opts.version)) usageError('--version needs a date like 2026-11-02.');
     } else {
       usageError(`Unknown option: ${arg}`);
     }
@@ -404,7 +443,7 @@ function parseArgs(argv) {
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 async function main() {
-  const { regionCodes, limit, outDir, source: sourceUrl } = parseArgs(process.argv.slice(2));
+  const { regionCodes, limit, outDir, source: sourceUrl, version } = parseArgs(process.argv.slice(2));
   const manifestPath = path.join(outDir, 'manifest.json');
 
   console.log('=== BiteInsight Offline Database Builder ===\n');
@@ -445,7 +484,7 @@ async function main() {
   const gunzip = zlib.createGunzip();
   const parser = parse({
     delimiter: '\t',
-    columns: true,
+    columns: checkExportHeader,
     skip_empty_lines: true,
     relax_column_count: true,
     relax_quotes: true,
@@ -520,7 +559,7 @@ async function main() {
   console.log(`Quality filtered: ${qualityFiltered.toLocaleString()} rows.\n`);
 
   // Finalize each region DB and build manifest
-  const today = new Date().toISOString().slice(0, 10);
+  const today = version;
   const buildDate = new Date().toISOString();
   const manifestRegions = {};
 
@@ -580,6 +619,8 @@ module.exports = {
   CREATE_TABLE_SQL,
   PRODUCT_COLUMNS,
   REGION_FILTERS,
+  REQUIRED_EXPORT_COLUMNS,
+  checkExportHeader,
 };
 
 if (require.main === module) {

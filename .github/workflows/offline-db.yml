@@ -6,13 +6,14 @@
 # unticked: it builds and checks, then keeps the files as a workflow
 # artifact for a few days instead of making a release.
 #
-# Nothing is published unless scripts/offline-db/check.js passes, and only
-# a full build (every region) can be published.
+# Nothing is published unless scripts/offline-db/check.js passes, only a
+# full build (every region) from main can be published, and only the
+# publish job gets a token that can write to the repo.
 name: Offline databases
 
 on:
   schedule:
-    - cron: '0 5 2 * *'   # 05:00 UTC on the 2nd of each month
+    - cron: '23 5 2 * *'   # 05:23 UTC on the 2nd (off the hour, when GitHub drops fewer runs)
   workflow_dispatch:
     inputs:
       dry_run:
@@ -25,7 +26,7 @@ on:
         default: ''
 
 permissions:
-  contents: write   # to create the release
+  contents: read
 
 concurrency:
   group: offline-db
@@ -39,6 +40,11 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 180
+    outputs:
+      publish: ${{ steps.plan.outputs.publish }}
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+      artifact: ${{ steps.plan.outputs.artifact }}
     env:
       OUT: ${{ github.workspace }}/offline-db-out
     steps:
@@ -48,6 +54,8 @@ jobs:
           EVENT: ${{ github.event_name }}
           DRY_RUN: ${{ inputs.dry_run }}
           REGION: ${{ inputs.region }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
         run: |
           publish=false
           if [ "$EVENT" = "schedule" ] || [ "$DRY_RUN" = "false" ]; then
@@ -62,11 +70,37 @@ jobs:
             echo "::error::A one-region build can't be published, the release has to hold every region. Run it again as a dry run, or leave region empty."
             exit 1
           fi
-          echo "publish=$publish" >> "$GITHUB_OUTPUT"
-          echo "region=$region" >> "$GITHUB_OUTPUT"
-          echo "Publish: $publish. Region: ${region:-all}."
+          if [ "$publish" = "true" ] && [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::Releases are only published from main, not $GITHUB_REF. Run it from main, or tick Dry run."
+            exit 1
+          fi
+
+          # The date the run started is the release's version and tag, even
+          # if the build finishes after midnight.
+          version=$(date -u +%Y-%m-%d)
+          tag="offline-db-v${version//-/.}"
+          if [ "$publish" = "true" ] && gh release view "$tag" --repo "$REPO" >/dev/null 2>&1; then
+            echo "::error::Release $tag already exists. Nothing was built. Delete it on the Releases page first if you want to replace it."
+            exit 1
+          fi
+
+          if [ "$publish" = "true" ]; then
+            artifact="offline-db-release-$GITHUB_RUN_NUMBER"
+          else
+            artifact="offline-db-dry-run-$GITHUB_RUN_NUMBER"
+          fi
+          {
+            echo "publish=$publish"
+            echo "region=$region"
+            echo "version=$version"
+            echo "tag=$tag"
+            echo "artifact=$artifact"
+          } >> "$GITHUB_OUTPUT"
+          echo "Publish: $publish. Region: ${region:-all}. Version: $version."
 
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-node@v6
         with:
@@ -82,9 +116,10 @@ jobs:
         working-directory: scripts/offline-db
         env:
           REGION: ${{ steps.plan.outputs.region }}
+          VERSION: ${{ steps.plan.outputs.version }}
         run: |
           df -h "$GITHUB_WORKSPACE"
-          args=(--out "$OUT")
+          args=(--out "$OUT" --version "$VERSION")
           if [ -n "$REGION" ]; then args+=(--region "$REGION"); fi
           node build-offline-db.js "${args[@]}"
           ls -l "$OUT"
@@ -99,25 +134,51 @@ jobs:
           if [ -n "$REGION" ]; then args+=(--regions "$REGION"); fi
           node check.js "${args[@]}"
 
-      - name: Keep the files (dry run)
-        if: steps.plan.outputs.publish != 'true'
+      # Dry run: the files to look at. Publish: what the publish job uploads.
+      - name: Keep the files
         uses: actions/upload-artifact@v6
         with:
-          name: offline-db-dry-run-${{ github.run_number }}
+          name: ${{ steps.plan.outputs.artifact }}
           path: ${{ env.OUT }}
-          retention-days: 5
+          retention-days: ${{ steps.plan.outputs.publish == 'true' && 1 || 5 }}
           if-no-files-found: error
 
+  publish:
+    needs: build
+    if: needs.build.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write   # to create the release
+    env:
+      OUT: ${{ github.workspace }}/offline-db-out
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: ${{ needs.build.outputs.artifact }}
+          path: ${{ env.OUT }}
+
       - name: Publish the release
-        if: steps.plan.outputs.publish == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
+          VERSION: ${{ needs.build.outputs.version }}
+          TAG: ${{ needs.build.outputs.tag }}
         run: |
           version=$(node -p "require(process.env.OUT + '/manifest.json').version")
+          if [ "$version" != "$VERSION" ]; then
+            echo "::error::manifest.json says $version but the build was for $VERSION. Nothing was published."
+            exit 1
+          fi
           dotted=${version//-/.}
-          tag="offline-db-v$dotted"
+          tag="$TAG"
 
+          # Checked again here: this token can also see drafts left behind
+          # by a failed publish, which the build job's token can't.
           if gh release view "$tag" --repo "$REPO" >/dev/null 2>&1; then
             echo "::error::Release $tag already exists (maybe as a draft). Nothing was published. Delete it on the Releases page first if you want to replace it."
             exit 1
@@ -146,3 +207,21 @@ jobs:
 
           gh release edit "$tag" --repo "$REPO" --draft=false --latest
           echo "Published https://github.com/$REPO/releases/tag/$tag" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # GitHub turns off scheduled workflows in a public repo after 60 days
+  # with no commits. Turning them back on each month resets that clock, for
+  # this workflow and the nightly UK sync.
+  keepalive:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Keep the schedules on
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh workflow enable offline-db.yml --repo "$REPO"
+          gh workflow enable off-uk-sync.yml --repo "$REPO"

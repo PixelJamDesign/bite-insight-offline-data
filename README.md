@@ -12,9 +12,11 @@ Product data © Open Food Facts contributors.
 
 ## Updating
 
-A GitHub Action (`.github/workflows/offline-db.yml`) rebuilds the databases at 05:00 UTC on the 2nd of every month, after Open Food Facts has refreshed its export. It streams the export, builds one file per country with `scripts/offline-db/build-offline-db.js`, checks them, then publishes a release tagged `offline-db-vYYYY.MM.DD` and marks it as the latest. The app picks it up from there.
+A GitHub Action (`.github/workflows/offline-db.yml`) rebuilds the databases early on the 2nd of every month (05:23 UTC), after Open Food Facts has refreshed its export. It streams the export, builds one file per country with `scripts/offline-db/build-offline-db.js`, checks them, then publishes a release tagged `offline-db-vYYYY.MM.DD` and marks it as the latest. The app picks it up from there.
 
-The scripts in `scripts/offline-db/` are the ones to change. The app repo used to have its own copy of the build script; that one is retired.
+The scripts in `scripts/offline-db/` are the ones to change. The app repo used to have its own copy of the build script. It's now just a note pointing here, so don't build from it.
+
+Only the publish step can write to this repo, and it only runs for a full build from `main` that passed every check. Each month the job also switches the schedules back on, because GitHub turns off scheduled workflows in a public repo after 60 days without a commit. If a month goes by with no new release, look at the Actions tab: a run that was skipped or failed shows there.
 
 ### Checks
 
@@ -23,9 +25,12 @@ The scripts in `scripts/offline-db/` are the ones to change. The app repo used t
 - the file opens and passes SQLite's integrity check
 - it has every column the app reads (allergens, traces and ingredient ids among them) and a version in its metadata
 - the allergen data is really there: enough products have it, no product with ingredients is missing it, and some list an allergen (the May 2026 release had none at all)
+- the "may contain" data is there too: some products list a trace
 - the product count hasn't fallen more than 20% or doubled since the last release
 
 It also checks that `manifest.json` lists every file with its real size and product count.
+
+Before any of that, the build stops at the export's header row if a column it reads is missing. That's how the May 2026 release lost its allergens: the old script read a column the export doesn't have, so every row came out empty.
 
 ### Running it by hand
 

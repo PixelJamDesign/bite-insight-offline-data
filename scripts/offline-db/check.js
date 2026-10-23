@@ -8,12 +8,14 @@
  *
  * For every region it checks that:
  *   - the .db opens and PRAGMA integrity_check says ok
- *   - it has every products column the app reads (allergens, traces and
- *     ingredient_ids included) and a metadata table with version,
- *     product_count, region and schema
+ *   - it has every products column the app reads (APP_COLUMNS, written out
+ *     here so a column dropped from the build script is still caught, plus
+ *     every column the build script creates) and a metadata table with
+ *     version, product_count, region and schema
  *   - allergen data is really there: enough rows have non-NULL allergens,
  *     no row with ingredients is missing its allergens or traces, some rows
- *     list an allergen, and ingredient ids came through. The May 2026
+ *     list an allergen, some list a 'may contain' trace, and ingredient ids
+ *     came through. The May 2026
  *     release had NULL allergens on every row; this is the check that would
  *     have stopped it.
  *   - the product count is close to the last release's: no more than 20%
@@ -67,7 +69,35 @@ const MIN_WITH_ALLERGEN_SHARE = 0.2;
 // Of the products with ingredient text, at least this many must have ids.
 const MIN_IDS_PER_TEXT = 0.7;
 
+// Of the products with traces data, at least this many must list a trace.
+// '' everywhere would mean the traces columns went missing, which would drop
+// every 'may contain' warning offline. The 23 Oct 2026 full build had
+// gb 15.7%, us 2.1%, fr 31.4%, de 31.8%, es 34.2%, it 35.2%, in 7.5%,
+// au 28.7%; the floors sit at about a third of that.
+const MIN_WITH_TRACE_SHARE = {
+  gb: 0.05,
+  us: 0.007,
+  fr: 0.1,
+  de: 0.1,
+  es: 0.1,
+  it: 0.1,
+  in: 0.025,
+  au: 0.09,
+};
+const DEFAULT_MIN_WITH_TRACE_SHARE = 0.01;
+
 const METADATA_KEYS = ['version', 'product_count', 'region', 'schema'];
+
+// The columns lib/offlineDatabase.ts (getOfflineProduct) reads. Kept here by
+// hand on purpose: PRODUCT_COLUMNS comes from the build script, so it can't
+// notice the build script losing one.
+const APP_COLUMNS = [
+  'barcode', 'product_name', 'brand', 'image_url', 'quantity', 'nutriscore_grade',
+  'energy_kcal', 'carbs', 'sugars', 'fiber', 'fat', 'saturated_fat', 'proteins', 'salt',
+  'serving_size', 'energy_kcal_serving', 'carbs_serving', 'sugars_serving', 'fiber_serving',
+  'fat_serving', 'saturated_fat_serving', 'proteins_serving', 'salt_serving',
+  'ingredients_text', 'allergens', 'traces', 'ingredients_json', 'ingredient_ids', 'off_lang',
+];
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -151,7 +181,7 @@ function checkDatabase(code, file) {
     if (failures.length) return { failures, stats };
 
     const columns = new Set(db.prepare('PRAGMA table_info(products)').all().map((c) => c.name));
-    const missing = PRODUCT_COLUMNS.filter((c) => !columns.has(c));
+    const missing = [...new Set([...APP_COLUMNS, ...PRODUCT_COLUMNS])].filter((c) => !columns.has(c));
     if (missing.length) {
       failures.push(`products is missing column(s): ${missing.join(', ')}`);
       return { failures, stats };
@@ -170,6 +200,7 @@ function checkDatabase(code, file) {
         SUM(allergens IS NOT NULL) AS allergens_known,
         SUM(allergens IS NOT NULL AND allergens <> '') AS with_allergen,
         SUM(traces IS NOT NULL) AS traces_known,
+        SUM(traces IS NOT NULL AND traces <> '') AS with_trace,
         SUM(ingredients_text IS NOT NULL) AS with_text,
         SUM(ingredient_ids IS NOT NULL) AS with_ids,
         SUM((ingredients_text IS NOT NULL OR ingredient_ids IS NOT NULL)
@@ -184,6 +215,7 @@ function checkDatabase(code, file) {
     stats.allergenShare = c.total ? c.allergens_known / c.total : 0;
     stats.withAllergenShare = c.allergens_known ? c.with_allergen / c.allergens_known : 0;
     stats.tracesShare = c.total ? c.traces_known / c.total : 0;
+    stats.withTraceShare = c.traces_known ? c.with_trace / c.traces_known : 0;
     stats.idsPerText = c.with_text ? c.with_ids / c.with_text : 0;
 
     if (c.total === 0) {
@@ -202,6 +234,10 @@ function checkDatabase(code, file) {
     if (c.lost) failures.push(`${c.lost} products have ingredients but NULL allergens or traces`);
     if (stats.withAllergenShare < MIN_WITH_ALLERGEN_SHARE) {
       failures.push(`only ${pct(stats.withAllergenShare)} of products with allergen data list an allergen (needs ${pct(MIN_WITH_ALLERGEN_SHARE)})`);
+    }
+    const minTrace = MIN_WITH_TRACE_SHARE[code] ?? DEFAULT_MIN_WITH_TRACE_SHARE;
+    if (stats.withTraceShare < minTrace) {
+      failures.push(`only ${pct(stats.withTraceShare)} of products with traces data list a 'may contain' trace (needs ${pct(minTrace)})`);
     }
     if (c.untagged) failures.push(`${c.untagged} rows have allergens that aren't lang:name tags`);
     if (c.with_text && stats.idsPerText < MIN_IDS_PER_TEXT) {
@@ -331,10 +367,10 @@ async function main() {
   // Report
   console.log('');
   const table = [
-    '| Region | Products | Allergen data | Lists an allergen | Traces data | Ids per text | vs last release | Result |',
-    '|---|---:|---:|---:|---:|---:|---|---|',
+    '| Region | Products | Allergen data | Lists an allergen | Traces data | Lists a trace | Ids per text | vs last release | Result |',
+    '|---|---:|---:|---:|---:|---:|---:|---|---|',
     ...rows.map(({ code, stats: s, countNote, ok }) => (
-      `| ${code} | ${s.total !== undefined ? s.total.toLocaleString() : '-'} | ${s.allergenShare !== undefined ? pct(s.allergenShare) : '-'} | ${s.withAllergenShare !== undefined ? pct(s.withAllergenShare) : '-'} | ${s.tracesShare !== undefined ? pct(s.tracesShare) : '-'} | ${s.idsPerText !== undefined ? pct(s.idsPerText) : '-'} | ${countNote || '-'} | ${ok ? 'ok' : 'FAIL'} |`
+      `| ${code} | ${s.total !== undefined ? s.total.toLocaleString() : '-'} | ${s.allergenShare !== undefined ? pct(s.allergenShare) : '-'} | ${s.withAllergenShare !== undefined ? pct(s.withAllergenShare) : '-'} | ${s.tracesShare !== undefined ? pct(s.tracesShare) : '-'} | ${s.withTraceShare !== undefined ? pct(s.withTraceShare) : '-'} | ${s.idsPerText !== undefined ? pct(s.idsPerText) : '-'} | ${countNote || '-'} | ${ok ? 'ok' : 'FAIL'} |`
     )),
   ].join('\n');
   console.log(table);
