@@ -1,0 +1,17 @@
+{
+  "name": "bite-insight-offline-db",
+  "private": true,
+  "description": "Builds and checks the Bite Insight offline product databases from the Open Food Facts export.",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "node build-offline-db.js",
+    "check": "node check.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "12.11.1",
+    "csv-parse": "5.6.0"
+  }
+}
