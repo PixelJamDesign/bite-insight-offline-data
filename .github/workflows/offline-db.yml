@@ -1,0 +1,148 @@
+# Builds the offline product databases the app downloads, checks them and
+# publishes them as the latest release.
+#
+# Monthly on the 2nd, after Open Food Facts has refreshed its export.
+# A run by hand from the Actions tab is a dry run unless "dry_run" is
+# unticked: it builds and checks, then keeps the files as a workflow
+# artifact for a few days instead of making a release.
+#
+# Nothing is published unless scripts/offline-db/check.js passes, and only
+# a full build (every region) can be published.
+name: Offline databases
+
+on:
+  schedule:
+    - cron: '0 5 2 * *'   # 05:00 UTC on the 2nd of each month
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Dry run (build and check, no release)
+        type: boolean
+        default: true
+      region:
+        description: Build one region only, e.g. gb (dry runs only). Leave empty for all
+        type: string
+        default: ''
+
+permissions:
+  contents: write   # to create the release
+
+concurrency:
+  group: offline-db
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash   # bash -eo pipefail: any failing command stops the job
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      OUT: ${{ github.workspace }}/offline-db-out
+    steps:
+      - name: Pick mode
+        id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          REGION: ${{ inputs.region }}
+        run: |
+          publish=false
+          if [ "$EVENT" = "schedule" ] || [ "$DRY_RUN" = "false" ]; then
+            publish=true
+          fi
+          region=$(printf '%s' "$REGION" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+          if [ -n "$region" ] && ! [[ "$region" =~ ^[a-z]{2}$ ]]; then
+            echo "::error::region should be one code like gb, not \"$REGION\"."
+            exit 1
+          fi
+          if [ "$publish" = "true" ] && [ -n "$region" ]; then
+            echo "::error::A one-region build can't be published, the release has to hold every region. Run it again as a dry run, or leave region empty."
+            exit 1
+          fi
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "region=$region" >> "$GITHUB_OUTPUT"
+          echo "Publish: $publish. Region: ${region:-all}."
+
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: scripts/offline-db/package-lock.json
+
+      - name: Install
+        working-directory: scripts/offline-db
+        run: npm ci
+
+      - name: Build
+        working-directory: scripts/offline-db
+        env:
+          REGION: ${{ steps.plan.outputs.region }}
+        run: |
+          df -h "$GITHUB_WORKSPACE"
+          args=(--out "$OUT")
+          if [ -n "$REGION" ]; then args+=(--region "$REGION"); fi
+          node build-offline-db.js "${args[@]}"
+          ls -l "$OUT"
+          df -h "$GITHUB_WORKSPACE"
+
+      - name: Check
+        working-directory: scripts/offline-db
+        env:
+          REGION: ${{ steps.plan.outputs.region }}
+        run: |
+          args=(--dir "$OUT")
+          if [ -n "$REGION" ]; then args+=(--regions "$REGION"); fi
+          node check.js "${args[@]}"
+
+      - name: Keep the files (dry run)
+        if: steps.plan.outputs.publish != 'true'
+        uses: actions/upload-artifact@v6
+        with:
+          name: offline-db-dry-run-${{ github.run_number }}
+          path: ${{ env.OUT }}
+          retention-days: 5
+          if-no-files-found: error
+
+      - name: Publish the release
+        if: steps.plan.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          version=$(node -p "require(process.env.OUT + '/manifest.json').version")
+          dotted=${version//-/.}
+          tag="offline-db-v$dotted"
+
+          if gh release view "$tag" --repo "$REPO" >/dev/null 2>&1; then
+            echo "::error::Release $tag already exists (maybe as a draft). Nothing was published. Delete it on the Releases page first if you want to replace it."
+            exit 1
+          fi
+
+          node scripts/offline-db/release-notes.js --dir "$OUT" > "$RUNNER_TEMP/notes.md"
+          files=("$OUT"/*.db "$OUT/manifest.json")
+
+          # Upload to a draft first. The app only sees published releases, so
+          # if an upload fails nothing changes for users.
+          gh release create "$tag" "${files[@]}" \
+            --repo "$REPO" \
+            --draft \
+            --target "$GITHUB_SHA" \
+            --title "Offline Database v$dotted" \
+            --notes-file "$RUNNER_TEMP/notes.md"
+
+          # Every file must be on the draft at its full size before it goes live.
+          uploaded=$(gh release view "$tag" --repo "$REPO" --json assets --jq '.assets[] | "\(.name) \(.size)"' | sort)
+          expected=$(for f in "${files[@]}"; do echo "$(basename "$f") $(stat -c %s "$f")"; done | sort)
+          if [ "$uploaded" != "$expected" ]; then
+            echo "::error::The draft release $tag doesn't hold every file at the right size, so it was left as a draft."
+            diff <(echo "$expected") <(echo "$uploaded") || true
+            exit 1
+          fi
+
+          gh release edit "$tag" --repo "$REPO" --draft=false --latest
+          echo "Published https://github.com/$REPO/releases/tag/$tag" | tee -a "$GITHUB_STEP_SUMMARY"
